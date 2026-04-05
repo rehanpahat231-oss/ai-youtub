@@ -7,6 +7,7 @@ import imageio.v3 as iio
 from datetime import datetime
 import json
 import sys
+import time
 
 # Setup folders
 os.makedirs('outputs', exist_ok=True)
@@ -39,24 +40,42 @@ def get_content():
         "prompt": f"high quality {niche}, cinematic, 4k, trending on social media"
     }
 
-def generate_image(prompt, filename):
-    try:
-        log(f"Generating image...")
-        encoded = requests.utils.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&seed={random.randint(1,9999)}"
+def generate_image(prompt, filename, max_retries=3):
+    """Generate with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            log(f"Generating image... (attempt {attempt + 1}/{max_retries})")
+            
+            # Different seed for each retry
+            seed = random.randint(1, 99999)
+            encoded = requests.utils.quote(prompt)
+            url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&nologo=true&seed={seed}"
+            
+            # Increased timeout to 120 seconds
+            r = requests.get(url, timeout=120)
+            
+            if r.status_code == 200 and len(r.content) > 5000:
+                path = f"outputs/{filename}"
+                with open(path, 'wb') as f:
+                    f.write(r.content)
+                log(f"✅ Image saved: {filename} ({len(r.content)//1024}KB)")
+                return path
+            
+            log(f"❌ Attempt {attempt + 1} failed: Status {r.status_code}")
+            
+        except requests.exceptions.Timeout:
+            log(f"⏱️ Timeout on attempt {attempt + 1}, retrying...")
+        except Exception as e:
+            log(f"❌ Error on attempt {attempt + 1}: {str(e)[:50]}")
         
-        r = requests.get(url, timeout=60)
-        if r.status_code == 200 and len(r.content) > 5000:
-            path = f"outputs/{filename}"
-            with open(path, 'wb') as f:
-                f.write(r.content)
-            log(f"✅ Image saved: {filename}")
-            return path
-        log(f"❌ Image download failed")
-        return None
-    except Exception as e:
-        log(f"❌ Error: {e}")
-        return None
+        # Wait before retry
+        if attempt < max_retries - 1:
+            wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+            log(f"⏳ Waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+    
+    log(f"❌ All {max_retries} attempts failed for {filename}")
+    return None
 
 def create_video(img1, img2, content):
     try:
@@ -66,6 +85,7 @@ def create_video(img1, img2, content):
         duration = 3.5
         
         for idx, img_path in enumerate([img1, img2]):
+            log(f"Processing image {idx + 1}...")
             img = Image.open(img_path).convert('RGB')
             img = img.resize((1080, 1920))
             
@@ -100,13 +120,19 @@ def create_video(img1, img2, content):
                 cropped = img.crop((left, top, left+new_w, top+new_h))
                 cropped = cropped.resize((1080, 1920))
                 frames.append(np.array(cropped))
+            
+            log(f"✅ Image {idx + 1} processed")
         
         output = "outputs/video.mp4"
+        log(f"Saving video ({len(frames)} frames)...")
         iio.imwrite(output, frames, fps=fps, codec="libx264", quality=8)
         log(f"✅ Video created: {output}")
         return output
+        
     except Exception as e:
         log(f"❌ Video error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def upload_to_youtube(video_path, content):
@@ -147,6 +173,7 @@ def upload_to_youtube(video_path, content):
         with open(f"logs/uploads.txt", "a") as f:
             f.write(f"{datetime.now()} | {video_id} | {content['title']}\n")
         return True
+        
     except Exception as e:
         log(f"❌ Upload failed: {e}")
         return False
@@ -158,11 +185,24 @@ def main():
     log(f"Niche: {content['niche']}")
     log(f"Title: {content['title'][:60]}")
     
+    # Generate images with retry
     img1 = generate_image(content['prompt'], "img1.jpg")
-    img2 = generate_image(content['prompt'] + " scene 2", "img2.jpg")
+    
+    # Small delay between requests
+    time.sleep(2)
+    
+    img2 = generate_image(content['prompt'] + " different angle", "img2.jpg")
     
     if not img1 or not img2:
-        log("❌ Images failed")
+        log("❌ Images failed - trying fallback prompts...")
+        # Try simpler prompts as fallback
+        if not img1:
+            img1 = generate_image("cute baby", "img1.jpg", max_retries=2)
+        if not img2:
+            img2 = generate_image("adorable baby", "img2.jpg", max_retries=2)
+    
+    if not img1 or not img2:
+        log("❌ All image attempts failed")
         return 1
     
     video = create_video(img1, img2, content)
